@@ -33,7 +33,7 @@ admin.initializeApp({
 const db = admin.database();
 
 // ─── Config ───────────────────────────────────────────────
-const TWELVE_DATA_KEY = '80ddd35489f3427d8c43f29c995d6372';
+const TWELVE_DATA_KEY = '863b50fb37154d15bc061bc00ed797dc';
 const PAIRS = [
   'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD', 'NZD/USD', 'USD/CAD',
   'EUR/GBP', 'EUR/JPY', 'GBP/JPY', 'EUR/CHF', 'AUD/JPY', 'GBP/CHF', 'EUR/AUD', 'CAD/JPY'
@@ -66,11 +66,12 @@ const SELL_CONFIG = {
   tpMult: 1.75
 };
 
-const RATE_LIMIT_MS = 8000; // 8s entre appels API (Twelve Data free tier)
+const RATE_LIMIT_MS = 10000; // 10s entre appels API (marge de sécurité contre les 429)
 
 // État en mémoire
 let lastScanTime = null;
 let activeSignals = [];
+let scanInProgress = false;
 
 // ─── Indicateurs ──────────────────────────────────────────
 
@@ -296,76 +297,85 @@ function sleep(ms) {
 // ─── Scan principal ───────────────────────────────────────
 
 async function scanAllPairs() {
+  if (scanInProgress) {
+    console.log(`[${new Date().toISOString()}] Scan déjà en cours, requête ignorée.`);
+    return;
+  }
+  scanInProgress = true;
   console.log(`[${new Date().toISOString()}] Démarrage scan APEX...`);
   const newSignals = [];
 
-  for (const pair of PAIRS) {
-    try {
-      const candles = await fetchCandles(pair, 300);
-      if (candles.length < 200) {
-        console.log(`  ⚠️  ${pair}: pas assez de données (${candles.length})`);
-        await sleep(RATE_LIMIT_MS);
-        continue;
+  try {
+    for (const pair of PAIRS) {
+      try {
+        const candles = await fetchCandles(pair, 300);
+        if (candles.length < 200) {
+          console.log(`  ⚠️  ${pair}: pas assez de données (${candles.length})`);
+          await sleep(RATE_LIMIT_MS);
+          continue;
+        }
+
+        const buyResult = computeBuySignal(candles);
+        const sellResult = computeSellSignal(candles);
+
+        const lastIdx = candles.length - 1;
+        const lastCandle = candles[lastIdx];
+
+        if (buyResult.signal[lastIdx] === 1) {
+          const atr = buyResult.atr[lastIdx];
+          const entry = lastCandle.close;
+          const sl = entry - atr * BUY_CONFIG.slMult;
+          const tp = entry + atr * BUY_CONFIG.tpMult;
+          newSignals.push({
+            pair, direction: 'BUY', entry, sl, tp, atr,
+            datetime: lastCandle.datetime,
+            key: `${pair.replace('/', '_')}_${lastCandle.datetime}_BUY`
+          });
+          console.log(`  🟢 BUY signal: ${pair} @ ${entry}`);
+        }
+
+        if (sellResult.signal[lastIdx] === -1) {
+          const atr = sellResult.atr[lastIdx];
+          const entry = lastCandle.close;
+          const sl = entry + atr * SELL_CONFIG.slMult;
+          const tp = entry - atr * SELL_CONFIG.tpMult;
+          newSignals.push({
+            pair, direction: 'SELL', entry, sl, tp, atr,
+            datetime: lastCandle.datetime,
+            key: `${pair.replace('/', '_')}_${lastCandle.datetime}_SELL`
+          });
+          console.log(`  🔴 SELL signal: ${pair} @ ${entry}`);
+        }
+
+      } catch (err) {
+        console.error(`  ❌ Erreur ${pair}: ${err.message}`);
       }
-
-      const buyResult = computeBuySignal(candles);
-      const sellResult = computeSellSignal(candles);
-
-      const lastIdx = candles.length - 1;
-      const lastCandle = candles[lastIdx];
-
-      if (buyResult.signal[lastIdx] === 1) {
-        const atr = buyResult.atr[lastIdx];
-        const entry = lastCandle.close;
-        const sl = entry - atr * BUY_CONFIG.slMult;
-        const tp = entry + atr * BUY_CONFIG.tpMult;
-        newSignals.push({
-          pair, direction: 'BUY', entry, sl, tp, atr,
-          datetime: lastCandle.datetime,
-          key: `${pair.replace('/', '_')}_${lastCandle.datetime}_BUY`
-        });
-        console.log(`  🟢 BUY signal: ${pair} @ ${entry}`);
-      }
-
-      if (sellResult.signal[lastIdx] === -1) {
-        const atr = sellResult.atr[lastIdx];
-        const entry = lastCandle.close;
-        const sl = entry + atr * SELL_CONFIG.slMult;
-        const tp = entry - atr * SELL_CONFIG.tpMult;
-        newSignals.push({
-          pair, direction: 'SELL', entry, sl, tp, atr,
-          datetime: lastCandle.datetime,
-          key: `${pair.replace('/', '_')}_${lastCandle.datetime}_SELL`
-        });
-        console.log(`  🔴 SELL signal: ${pair} @ ${entry}`);
-      }
-
-    } catch (err) {
-      console.error(`  ❌ Erreur ${pair}: ${err.message}`);
+      await sleep(RATE_LIMIT_MS);
     }
-    await sleep(RATE_LIMIT_MS);
-  }
 
-  lastScanTime = new Date().toISOString();
+    lastScanTime = new Date().toISOString();
 
-  // Sauvegarder les nouveaux signaux dans Firebase (sans dupliquer)
-  for (const sig of newSignals) {
-    const ref = db.ref(`/apex/signals/${sig.key}`);
-    const existing = await ref.once('value');
-    if (!existing.exists()) {
-      await ref.set({ ...sig, result: null, closedAt: null });
-      activeSignals.push(sig);
+    // Sauvegarder les nouveaux signaux dans Firebase (sans dupliquer)
+    for (const sig of newSignals) {
+      const ref = db.ref(`/apex/signals/${sig.key}`);
+      const existing = await ref.once('value');
+      if (!existing.exists()) {
+        await ref.set({ ...sig, result: null, closedAt: null });
+        activeSignals.push(sig);
+      }
     }
+
+    await db.ref('/apex/summary').update({
+      lastScan: lastScanTime,
+      pairs: PAIRS.length,
+      buyConfig: BUY_CONFIG,
+      sellConfig: SELL_CONFIG
+    });
+
+    console.log(`[${new Date().toISOString()}] Scan terminé. ${newSignals.length} nouveaux signaux.`);
+  } finally {
+    scanInProgress = false;
   }
-
-  await db.ref('/apex/summary').update({
-    lastScan: lastScanTime,
-    pairs: PAIRS.length,
-    buyConfig: BUY_CONFIG,
-    sellConfig: SELL_CONFIG
-  });
-
-  console.log(`[${new Date().toISOString()}] Scan terminé. ${newSignals.length} nouveaux signaux.`);
 }
 
 // ─── Routes HTTP ──────────────────────────────────────────
