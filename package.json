@@ -1,0 +1,14 @@
+{
+  "name": "apex-server",
+  "version": "1.0.0",
+  "description": "APEX - Serveur de signaux trading forex (BUY: compression volatilité, SELL: épuisement RSI)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "firebase-admin": "^12.0.0",
+    "axios": "^1.6.0"
+  }
+}
